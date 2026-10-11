@@ -55,6 +55,9 @@ jobs:
           fi
           PROJECT_DIR=$(cd "$(dirname "$GRADLEW")" && pwd)
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          # إصلاح gradlew: علامات الاقتباس داخل DEFAULT_JVM_OPTS تُقرأ كاسم كلاس في Java
+          sed -i 's/\r$//' "$PROJECT_DIR/gradlew"
+          sed -i "s/^DEFAULT_JVM_OPTS=.*/DEFAULT_JVM_OPTS='-Xmx64m -Xms64m'/" "$PROJECT_DIR/gradlew"
           chmod +x "$PROJECT_DIR/gradlew"
           echo "Gradle project: $PROJECT_DIR"
           ls -la "$PROJECT_DIR"
