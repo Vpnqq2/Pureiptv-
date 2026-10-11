@@ -1,3 +1,4 @@
+
 name: Build APK
 
 on:
@@ -37,7 +38,6 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Extract a valid ZIP, or use project files directly.
       - name: Extract project and locate Android root
         shell: bash
         run: |
@@ -104,13 +104,6 @@ jobs:
           echo "Android project root: $PROJECT_DIR"
           ls -la "$PROJECT_DIR"
 
-      # Install the Gradle version specified by this project.
-      # This does not require gradlew or gradle-wrapper.jar in the ZIP.
-      - name: Set up Gradle 9.3.1
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "9.3.1"
-
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
@@ -127,6 +120,11 @@ jobs:
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
 
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
