@@ -30,8 +30,9 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # SDK موجود مسبقاً على ubuntu-latest، نكتفي بقبول التراخيص
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       # فك ضغط المشروع تلقائياً وإيجاد مجلد gradlew
       - name: Unzip project and locate Gradle root
