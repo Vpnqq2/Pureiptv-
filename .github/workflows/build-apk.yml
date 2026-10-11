@@ -95,8 +95,17 @@ jobs:
           distribution: temurin
           java-version: ${{ steps.proj.outputs.jdk }}
 
-      - name: Set up Android SDK (accepts licenses)
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest already ships the Android SDK; we only need to accept its licenses
+      # so Gradle can download any missing platform / build-tools.
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          SDKM="$(command -v sdkmanager || true)"
+          if [ -z "$SDKM" ]; then
+            SDKM="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n1)"
+          fi
+          echo "Using $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
 
       # The project zip has no gradlew / gradle-wrapper.jar, so we install the exact Gradle version it needs.
       - name: Set up Gradle
