@@ -6,22 +6,29 @@ on:
       build_type:
         description: "نوع البناء"
         type: choice
-        options: [debug, release]
+        options:
+          - debug
+          - release
         default: debug
+
   push:
     paths:
       - "**.zip"
       - ".github/workflows/build-apk.yml"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
+
     env:
       BUILD_TYPE: ${{ github.event.inputs.build_type || 'debug' }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -30,81 +37,117 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # SDK موجود مسبقاً على ubuntu-latest، نكتفي بقبول التراخيص
-      - name: Accept Android SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-
-      # فك ضغط المشروع تلقائياً وإيجاد مجلد gradlew
-      - name: Unzip project and locate Gradle root
+      # Extract a valid ZIP, or use project files directly.
+      - name: Extract project and locate Android root
+        shell: bash
         run: |
-          set -e
-          ZIP=$(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' | head -n1 || true)
+          set -euo pipefail
+
+          mkdir -p _project
+          SEARCH="."
+
+          ZIP=""
+
+          while IFS= read -r -d '' FILE; do
+            if unzip -tq "$FILE" >/dev/null 2>&1; then
+              ZIP="$FILE"
+              break
+            else
+              echo "::warning::Skipping invalid ZIP: $FILE"
+            fi
+          done < <(
+            find . -maxdepth 3 -type f -iname '*.zip' \
+              -not -path './.git/*' \
+              -not -path './_project/*' \
+              -print0
+          )
+
           if [ -n "$ZIP" ]; then
-            echo "Found zip: $ZIP"
-            mkdir -p _project
-            unzip -q -o "$ZIP" -d _project -x '__MACOSX/*'
-            SEARCH=_project
+            echo "Using ZIP: $ZIP"
+            unzip -q -o "$ZIP" -d _project \
+              -x '__MACOSX/*' '*/__MACOSX/*'
+            SEARCH="_project"
           else
-            echo "No zip found, using repository files"
-            SEARCH=.
+            echo "No valid ZIP found; checking repository files."
           fi
-          GRADLEW=$(find "$SEARCH" -name gradlew -not -path '*/.git/*' | head -n1)
-          if [ -z "$GRADLEW" ]; then
-            echo "::error::gradlew not found. تأكد أن الـ zip يحتوي مشروع Android كامل"
+
+          SETTINGS=""
+
+          while IFS= read -r -d '' FILE; do
+            SETTINGS="$FILE"
+            break
+          done < <(
+            find "$SEARCH" -type f \
+              \( -name settings.gradle.kts \
+                 -o -name settings.gradle \) \
+              -not -path '*/.git/*' \
+              -not -path '*/.gradle/*' \
+              -print0
+          )
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Cannot find settings.gradle or settings.gradle.kts"
+            echo "Check that the ZIP contains the complete Android project."
             exit 1
           fi
-          PROJECT_DIR=$(cd "$(dirname "$GRADLEW")" && pwd)
+
+          PROJECT_DIR="$(cd "$(dirname "$SETTINGS")" && pwd)"
+
+          if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ] &&
+             [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
+            echo "::error::The Android app module was not found in $PROJECT_DIR"
+            exit 1
+          fi
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          # إصلاح gradlew: علامات الاقتباس داخل DEFAULT_JVM_OPTS تُقرأ كاسم كلاس في Java
-          sed -i 's/\r$//' "$PROJECT_DIR/gradlew"
-          sed -i "s/^DEFAULT_JVM_OPTS=.*/DEFAULT_JVM_OPTS='-Xmx64m -Xms64m'/" "$PROJECT_DIR/gradlew"
-          chmod +x "$PROJECT_DIR/gradlew"
-          echo "Gradle project: $PROJECT_DIR"
+
+          echo "Android project root: $PROJECT_DIR"
           ls -la "$PROJECT_DIR"
 
-      - name: Set up Gradle cache
+      # Install the Gradle version specified by this project.
+      # This does not require gradlew or gradle-wrapper.jar in the ZIP.
+      - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set -o pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
 
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
         run: |
-          if [ "$BUILD_TYPE" = "release" ]; then
-            ./gradlew assembleRelease --no-daemon --stacktrace
-          else
-            ./gradlew assembleDebug --no-daemon --stacktrace
-          fi
+          set -euo pipefail
 
-      # توقيع نسخة release (اختياري): يحتاج 4 secrets في GitHub
-      # KEYSTORE_BASE64 , KEYSTORE_PASSWORD , KEY_ALIAS , KEY_PASSWORD
-      - name: Sign release APK (if keystore secrets exist)
-        if: env.BUILD_TYPE == 'release'
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          set -e
-          if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "::warning::No keystore secrets, APK will stay unsigned (لن يُثبَّت على الهاتف)"
-            exit 0
+          echo "Gradle version:"
+          gradle --version
+
+          if [ "$BUILD_TYPE" = "release" ]; then
+            gradle assembleRelease --no-daemon --stacktrace
+          else
+            gradle assembleDebug --no-daemon --stacktrace
           fi
-          OUT="$PROJECT_DIR/app/build/outputs/apk/release"
-          UNSIGNED=$(ls "$OUT"/*.apk | head -n1)
-          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
-          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$OUT/aligned.apk"
-          "$BT/apksigner" sign \
-            --ks "$RUNNER_TEMP/release.jks" \
-            --ks-pass "pass:$KEYSTORE_PASSWORD" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --key-pass "pass:$KEY_PASSWORD" \
-            --out "$OUT/app-release-signed.apk" "$OUT/aligned.apk"
-          rm -f "$OUT/aligned.apk" "$UNSIGNED"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-${{ env.BUILD_TYPE }}-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/**/*.apk
+          name: iptv-player-${{ env.BUILD_TYPE }}-apk
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
+          retention-days: 14
