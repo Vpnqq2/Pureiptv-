@@ -1,161 +1,48 @@
-name: Build debug APK
-
-# Builds an installable debug APK (for testing) every time you push to the repo,
-# or manually from the Actions tab -> "Build debug APK" -> Run workflow.
-#
-# Works with BOTH layouts:
-#   1) the project files are unzipped in the repo (settings.gradle.kts at the repo root), or
-#   2) you upload the project as a .zip file (the workflow unzips it and finds the project inside).
-#
-# Gradle / JDK versions are read from the project itself, so they always match it.
+name: Build APK
 
 on:
   push:
-    branches: [main, master]
+    paths:
+      - '**.zip'
+      - '.github/workflows/build-apk.yml'
   workflow_dispatch:
-    inputs:
-      zip_path:
-        description: "Path of the project .zip inside the repo (leave empty to auto-detect)"
-        required: false
-        default: ""
-
-concurrency:
-  group: build-apk-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Locate project (unzip if the repo contains a .zip)
-        id: proj
-        shell: bash
-        env:
-          ZIP_INPUT: ${{ github.event.inputs.zip_path }}
+      - name: Unzip project
         run: |
-          set -euo pipefail
+          ZIP=$(ls *.zip | head -n1)
+          mkdir -p project
+          unzip -q -o "$ZIP" -d project
+          ROOT=$(dirname "$(find project -name settings.gradle.kts | head -n1)")
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
 
-          ZIP=""
-          if [ -n "${ZIP_INPUT:-}" ]; then
-            ZIP="$ZIP_INPUT"
-          elif [ -f settings.gradle.kts ] || [ -f settings.gradle ]; then
-            ZIP=""
-          else
-            mapfile -t ZIPS < <(find . -maxdepth 3 -type f -iname '*.zip' -not -path './.git/*' | sort)
-            echo "Zip files found: ${#ZIPS[@]}"
-            printf '  %s\n' "${ZIPS[@]:-}"
-            ZIP="${ZIPS[0]:-}"
-            if [ -z "$ZIP" ]; then
-              echo "::error::No Gradle project and no .zip file found in the repository."
-              exit 1
-            fi
-          fi
-
-          if [ -z "$ZIP" ]; then
-            PROJECT_DIR="$GITHUB_WORKSPACE"
-          else
-            echo "Using zip: $ZIP"
-            DEST="$RUNNER_TEMP/project"
-            rm -rf "$DEST" && mkdir -p "$DEST"
-            unzip -q -o "$ZIP" -d "$DEST"
-            mapfile -t SETTINGS < <(find "$DEST" -maxdepth 4 -type f \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/__MACOSX/*' | sort)
-            if [ -z "${SETTINGS[0]:-}" ]; then
-              echo "::error::settings.gradle(.kts) not found inside the zip."
-              exit 1
-            fi
-            PROJECT_DIR="$(dirname "${SETTINGS[0]}")"
-          fi
-
-          # Versions the project asks for (with safe fallbacks)
-          GV="$(sed -nE 's#.*gradle-([0-9][0-9.]*)-(bin|all)\.zip.*#\1#p' "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" 2>/dev/null | head -n1 || true)"
-          JV="$(sed -nE 's/^toolchainVersion=([0-9]+).*/\1/p' "$PROJECT_DIR/gradle/gradle-daemon-jvm.properties" 2>/dev/null | head -n1 || true)"
-          GV="${GV:-9.3.1}"
-          JV="${JV:-21}"
-
-          echo "Project dir : $PROJECT_DIR"
-          echo "Gradle      : $GV"
-          echo "JDK         : $JV"
-          {
-            echo "dir=$PROJECT_DIR"
-            echo "gradle=$GV"
-            echo "jdk=$JV"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ steps.proj.outputs.jdk }}
+          java-version: 17
 
-      # ubuntu-latest already ships the Android SDK; we only need to accept its licenses
-      # so Gradle can download any missing platform / build-tools.
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: |
-          SDKM="$(command -v sdkmanager || true)"
-          if [ -z "$SDKM" ]; then
-            SDKM="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n1)"
-          fi
-          echo "Using $SDKM"
-          yes | "$SDKM" --licenses > /dev/null || true
-
-      # The project zip has no gradlew / gradle-wrapper.jar, so we install the exact Gradle version it needs.
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: ${{ steps.proj.outputs.gradle }}
+          gradle-version: 8.9
 
-      - name: Create .env (optional Gemini key from repo secret)
-        shell: bash
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PROJECT_DIR: ${{ steps.proj.outputs.dir }}
-        run: |
-          if [ -n "${GEMINI_API_KEY:-}" ]; then
-            printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY" > "$PROJECT_DIR/.env"
-            echo ".env created"
-          else
-            echo "No GEMINI_API_KEY secret set - building without it."
-          fi
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Unit tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: gradle testDebugUnitTest --stacktrace
 
       - name: Build debug APK
-        working-directory: ${{ steps.proj.outputs.dir }}
-        run: gradle :app:assembleDebug --stacktrace
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleDebug --stacktrace
 
-      - name: Show APK
-        if: success()
-        shell: bash
-        env:
-          PROJECT_DIR: ${{ steps.proj.outputs.dir }}
-        run: |
-          {
-            echo "### Debug APK built"
-            ls -lh "$PROJECT_DIR"/app/build/outputs/apk/debug/*.apk | awk '{print "- " $9 " (" $5 ")"}'
-            echo ""
-            echo "Download it from the **Artifacts** section at the bottom of this page."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: iptv-player-debug-apk
-          path: ${{ steps.proj.outputs.dir }}/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload build reports (only if the build failed)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-reports
-          path: ${{ steps.proj.outputs.dir }}/app/build/reports/**
-          if-no-files-found: ignore
-          retention-days: 7
+          name: WALLIVERSE-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
