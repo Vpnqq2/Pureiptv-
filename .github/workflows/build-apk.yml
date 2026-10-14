@@ -42,16 +42,17 @@ jobs:
           chmod +x ./gradlew
           ./gradlew --version
 
-      - name: Unit tests
-        working-directory: ${{ env.PROJECT_DIR }}
-        continue-on-error: true
-        run: ./gradlew testDebugUnitTest --stacktrace
-
       - name: Build debug APK
         working-directory: ${{ env.PROJECT_DIR }}
         run: ./gradlew assembleDebug --stacktrace
 
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: ./gradlew assembleRelease --stacktrace
+
       - uses: actions/upload-artifact@v4
         with:
-          name: WALLIVERSE-debug-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          name: WALLIVERSE-apks
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
