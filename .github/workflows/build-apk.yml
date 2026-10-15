@@ -3,56 +3,60 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build Debug APK
+    name: Build Pure IPTV APK
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate and extract Android project
+      - name: Locate Android project
         id: project
         shell: bash
         run: |
           set -euo pipefail
 
-          settings="$(find . -maxdepth 5 -type f \
-            \( -name settings.gradle -o -name settings.gradle.kts \) \
+          SETTINGS=$(find . -maxdepth 5 -type f \
+            \( -name settings.gradle \
+            -o -name settings.gradle.kts \) \
             -not -path './.github-workspace/*' \
-            -print -quit)"
+            -print -quit)
 
-          if [[ -z "$settings" ]]; then
-            zip_file="$(find . -maxdepth 3 -type f \
-              -iname '*.zip' -print -quit)"
+          if [ -z "$SETTINGS" ]; then
+            ZIP_FILE=$(find . -maxdepth 3 -type f \
+              -iname '*.zip' -print -quit)
 
-            if [[ -z "$zip_file" ]]; then
+            if [ -z "$ZIP_FILE" ]; then
               echo "::error::No Gradle project or ZIP found."
               exit 1
             fi
 
             mkdir -p .github-workspace/project
-            unzip -q "$zip_file" -d .github-workspace/project
+            unzip -q "$ZIP_FILE" -d .github-workspace/project
 
-            settings="$(find .github-workspace/project \
+            SETTINGS=$(find .github-workspace/project \
               -type f \( -name settings.gradle \
               -o -name settings.gradle.kts \) \
-              -print -quit)"
+              -print -quit)
           fi
 
-          if [[ -z "$settings" ]]; then
+          if [ -z "$SETTINGS" ]; then
             echo "::error::Gradle settings file not found."
             exit 1
           fi
 
-          project_dir="$(dirname "$settings")"
-          echo "dir=$project_dir" >> "$GITHUB_OUTPUT"
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Android project: $PROJECT_DIR"
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -60,34 +64,119 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Configure Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Install Gradle and build APK
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$SDK/cmdline-tools" \
+              -type f -name sdkmanager -executable \
+              -print -quit)
+          fi
+
+          if [ -z "${SDKMANAGER:-}" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::Android SDK command-line tools not found."
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses \
+            >/dev/null 2>&1 || true
+
+      - name: Determine Android SDK versions
+        id: sdk
         shell: bash
         run: |
           set -euo pipefail
 
           PROJECT="${{ steps.project.outputs.dir }}"
-          VERSION="$(sed -n \
-            's/.*gradle-\([0-9][0-9.]*\)-bin.zip.*/\1/p' \
-            "$PROJECT/gradle/wrapper/gradle-wrapper.properties" \
-            | head -n 1)"
 
-          if [[ -z "$VERSION" ]]; then
-            echo "::error::Could not determine Gradle version."
-            exit 1
+          COMPILE_SDK=$(grep -RhoE \
+            'compileSdk(Version)?[[:space:]]*(=[[:space:]]*|[[:space:]]+)[0-9]+' \
+            "$PROJECT" \
+            --include='*.gradle' \
+            --include='*.gradle.kts' \
+            --exclude-dir=build \
+            2>/dev/null \
+            | grep -oE '[0-9]+' | head -n 1 || true)
+
+          if [ -z "$COMPILE_SDK" ]; then
+            COMPILE_SDK=35
           fi
 
-          curl -fL \
-            "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
-            -o /tmp/gradle.zip
+          BUILD_TOOLS="35.0.0"
 
-          unzip -q /tmp/gradle.zip -d /tmp
+          echo "compile=$COMPILE_SDK" >> "$GITHUB_OUTPUT"
+          echo "build_tools=$BUILD_TOOLS" >> "$GITHUB_OUTPUT"
 
+          echo "Compile SDK: $COMPILE_SDK"
+          echo "Build Tools: $BUILD_TOOLS"
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$SDK/cmdline-tools" \
+              -type f -name sdkmanager -executable \
+              -print -quit)
+          fi
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-${{ steps.sdk.outputs.compile }}" \
+            "build-tools;${{ steps.sdk.outputs.build_tools }}"
+
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.project.outputs.dir }}"
           cd "$PROJECT"
-          /tmp/gradle-${VERSION}/bin/gradle \
-            --no-daemon --stacktrace assembleDebug
+
+          if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+            VERSION=$(sed -n \
+              's/.*gradle-\([0-9][0-9.]*\)-bin.zip.*/\1/p' \
+              gradle/wrapper/gradle-wrapper.properties \
+              | head -n 1)
+
+            if [ -z "$VERSION" ]; then
+              echo "::error::Could not determine Gradle version."
+              exit 1
+            fi
+
+            if [ -f "./gradlew" ] && \
+               [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+              chmod +x ./gradlew
+              ./gradlew --no-daemon assembleDebug
+            else
+              curl -fL \
+                "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
+                -o /tmp/gradle.zip
+
+              unzip -q /tmp/gradle.zip -d /tmp
+
+              "/tmp/gradle-${VERSION}/bin/gradle" \
+                --no-daemon assembleDebug
+            fi
+          else
+            echo "::error::Gradle wrapper properties not found."
+            exit 1
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
