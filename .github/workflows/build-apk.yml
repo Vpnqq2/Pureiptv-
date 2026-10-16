@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Pure IPTV APK
 
 on:
   workflow_dispatch:
@@ -14,6 +14,7 @@ jobs:
   build:
     name: Build Pure IPTV APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -36,7 +37,7 @@ jobs:
               -iname '*.zip' -print -quit)
 
             if [ -z "$ZIP_FILE" ]; then
-              echo "::error::No Gradle project or ZIP found."
+              echo "::error::No Android project or ZIP found."
               exit 1
             fi
 
@@ -54,9 +55,16 @@ jobs:
             exit 1
           fi
 
-          PROJECT_DIR=$(dirname "$SETTINGS")
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+          PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+
           echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Android project: $PROJECT_DIR"
+          echo "Project: $PROJECT_DIR"
+
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "::error::The Android app module was not found."
+            exit 1
+          fi
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -74,20 +82,17 @@ jobs:
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "$SDK/platform-tools" >> "$GITHUB_PATH"
-          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
-          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          SDKMANAGER=$(find "$SDK/cmdline-tools" \
+            -type f -name sdkmanager -executable \
+            -print -quit)
 
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER=$(find "$SDK/cmdline-tools" \
-              -type f -name sdkmanager -executable \
-              -print -quit)
-          fi
-
-          if [ -z "${SDKMANAGER:-}" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "::error::Android SDK command-line tools not found."
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found."
             exit 1
           fi
+
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
 
           yes | "$SDKMANAGER" --licenses \
             >/dev/null 2>&1 || true
@@ -113,32 +118,49 @@ jobs:
             COMPILE_SDK=35
           fi
 
-          BUILD_TOOLS="35.0.0"
-
           echo "compile=$COMPILE_SDK" >> "$GITHUB_OUTPUT"
-          echo "build_tools=$BUILD_TOOLS" >> "$GITHUB_OUTPUT"
-
-          echo "Compile SDK: $COMPILE_SDK"
-          echo "Build Tools: $BUILD_TOOLS"
 
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
 
-          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER=$(find "$SDK/cmdline-tools" \
-              -type f -name sdkmanager -executable \
-              -print -quit)
-          fi
-
           "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-${{ steps.sdk.outputs.compile }}" \
-            "build-tools;${{ steps.sdk.outputs.build_tools }}"
+            "build-tools;35.0.0"
+
+      - name: Generate Debug Keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.project.outputs.dir }}"
+          KEYSTORE="$PROJECT/debug.keystore"
+
+          echo "Project directory: $PROJECT"
+
+          if [ ! -f "$KEYSTORE" ]; then
+            keytool -genkeypair \
+              -v \
+              -keystore "$KEYSTORE" \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -noprompt
+          fi
+
+          if [ ! -f "$KEYSTORE" ]; then
+            echo "::error::Keystore creation failed."
+            exit 1
+          fi
+
+          ls -l "$KEYSTORE"
+          echo "Debug keystore is ready."
 
       - name: Build Debug APK
         shell: bash
@@ -148,7 +170,18 @@ jobs:
           PROJECT="${{ steps.project.outputs.dir }}"
           cd "$PROJECT"
 
-          if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+          echo "Building from: $(pwd)"
+          echo "Checking debug keystore:"
+          ls -l "$(pwd)/debug.keystore"
+
+          if [ -f "./gradlew" ] && \
+             [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+
+            chmod +x ./gradlew
+            ./gradlew --no-daemon --stacktrace assembleDebug
+
+          elif [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+
             VERSION=$(sed -n \
               's/.*gradle-\([0-9][0-9.]*\)-bin.zip.*/\1/p' \
               gradle/wrapper/gradle-wrapper.properties \
@@ -159,29 +192,48 @@ jobs:
               exit 1
             fi
 
-            if [ -f "./gradlew" ] && \
-               [ -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-              chmod +x ./gradlew
-              ./gradlew --no-daemon assembleDebug
-            else
-              curl -fL \
-                "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
-                -o /tmp/gradle.zip
+            curl -fL \
+              "https://services.gradle.org/distributions/gradle-${VERSION}-bin.zip" \
+              -o /tmp/gradle.zip
 
-              unzip -q /tmp/gradle.zip -d /tmp
+            unzip -q /tmp/gradle.zip -d /tmp
 
-              "/tmp/gradle-${VERSION}/bin/gradle" \
-                --no-daemon assembleDebug
-            fi
+            "/tmp/gradle-${VERSION}/bin/gradle" \
+              --no-daemon --stacktrace assembleDebug
+
           else
             echo "::error::Gradle wrapper properties not found."
             exit 1
           fi
 
+      - name: Verify APK
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.project.outputs.dir }}"
+          APK="$PROJECT/app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "::error::APK was not generated at $APK"
+            find "$PROJECT/app/build/outputs" \
+              -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::APK file is empty."
+            exit 1
+          fi
+
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Pureiptv-debug-apk
-          path: ${{ steps.project.outputs.dir }}/app/build/outputs/apk/debug/*.apk
+          path: ${{ steps.verify.outputs.apk }}
           if-no-files-found: error
           retention-days: 14
